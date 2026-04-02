@@ -80,12 +80,12 @@ app.post('/api/participants/update', async (req, res) => {
   }
 });
 
-// ── AI CHAT ROUTE (GEMINI 2.5 FLASH) ─────────────
+// ── AI CHAT ROUTE (OPTIMIZED FOR HUMAN CHAT) ─────
 app.post('/api/chat', async (req, res) => {
   try {
     const { system, messages } = req.body;
 
-    // Format chat history for Gemini
+    // Convert messages to Gemini's user/model format
     const contents = messages.map(m => ({
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }]
@@ -94,12 +94,14 @@ app.post('/api/chat', async (req, res) => {
     const requestData = {
       contents,
       generationConfig: { 
-        maxOutputTokens: 1024, // High enough to prevent cutting off mid-sentence
-        temperature: 1.0       // Recommended for Gemini 2.5 natural flow
+        maxOutputTokens: 1024, // High enough to avoid mid-sentence cut-offs
+        temperature: 1.2,      // Higher = more human-like and creative
+        topP: 0.95,            // Diversifies word choice for less robotic chat
+        topK: 64
       }
     };
 
-    // Correctly apply System Instructions
+    // Use the official system_instruction field for better persona stickiness
     if (system) {
       requestData.system_instruction = {
         parts: [{ text: system }]
@@ -117,17 +119,15 @@ app.post('/api/chat', async (req, res) => {
 
     if (!geminiRes.ok) {
       const errText = await geminiRes.text();
-      console.error('Gemini API Error:', errText);
-      return res.status(502).json({ error: 'Gemini API Error', detail: errText });
+      console.error('Gemini Error:', errText);
+      return res.status(502).json({ error: 'AI unavailable', detail: errText });
     }
 
     const data = await geminiRes.json();
-    
-    // Safety check for response content
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
     
     if (!text) {
-      return res.json({ text: "I'm sorry, I'm having trouble thinking of a response. Can you try rephrasing?" });
+      return res.json({ text: "I'm not quite sure how to respond to that. Could you tell me more?" });
     }
 
     res.json({ text });
