@@ -1,4 +1,4 @@
-require('dotenv').config(); // Load environment variables
+require('dotenv').config(); 
 const express = require('express');
 const cors = require('cors');
 const { MongoClient } = require('mongodb');
@@ -7,13 +7,13 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(cors({ origin: '*' }));
 
-// ── ENV ──────────────────────────────────────────
+// ── CONFIGURATION ────────────────────────────────
 const MONGO_URI   = process.env.MONGO_URI   || '';
 const GEMINI_KEY  = process.env.GEMINI_KEY  || '';
 const MONGO_DB    = process.env.MONGO_DB    || 'ai_study';
 const PORT        = process.env.PORT        || 3000;
 
-// ── MongoDB singleton ────────────────────────────
+// ── MONGODB CONNECTION ───────────────────────────
 let _db = null;
 async function getDb() {
   if (_db) return _db;
@@ -24,20 +24,16 @@ async function getDb() {
   return _db;
 }
 
-// ── Health check ─────────────────────────────────
+// ── HEALTH CHECK ─────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 
-// ═══════════════════════════════════════════════
-//  MONGO ROUTES (Keep your existing routes)
-// ═══════════════════════════════════════════════
-
+// ── DATABASE ROUTES ──────────────────────────────
 app.post('/api/users/find', async (req, res) => {
   try {
     const db = await getDb();
     const user = await db.collection('users').findOne({ email: req.body.email });
     res.json({ document: user || null });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -48,7 +44,6 @@ app.post('/api/users/insert', async (req, res) => {
     const result = await db.collection('users').insertOne(req.body.document);
     res.json({ insertedId: result.insertedId });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -60,7 +55,6 @@ app.post('/api/users/update', async (req, res) => {
     const result = await db.collection('users').updateOne(filter, update);
     res.json({ matchedCount: result.matchedCount, modifiedCount: result.modifiedCount });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -71,7 +65,6 @@ app.post('/api/participants/insert', async (req, res) => {
     const result = await db.collection('participants').insertOne(req.body.document);
     res.json({ insertedId: result.insertedId });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -83,34 +76,30 @@ app.post('/api/participants/update', async (req, res) => {
     const result = await db.collection('participants').updateOne(filter, update);
     res.json({ matchedCount: result.matchedCount, modifiedCount: result.modifiedCount });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ═══════════════════════════════════════════════
-//  FIXED GEMINI CHAT ROUTE
-// ═══════════════════════════════════════════════
+// ── AI CHAT ROUTE (GEMINI 2.5 FLASH) ─────────────
 app.post('/api/chat', async (req, res) => {
   try {
     const { system, messages } = req.body;
 
-    // Convert messages to Gemini format (strictly user/model)
+    // Format chat history for Gemini
     const contents = messages.map(m => ({
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }]
     }));
 
-    // Prepare the request body
     const requestData = {
       contents,
-     generationConfig: { 
-  maxOutputTokens: 1024, // Increased from 240
-  temperature: 0.9 
-}
+      generationConfig: { 
+        maxOutputTokens: 1024, // High enough to prevent cutting off mid-sentence
+        temperature: 1.0       // Recommended for Gemini 2.5 natural flow
+      }
     };
 
-    // Use the official system_instruction field instead of injecting into conversation
+    // Correctly apply System Instructions
     if (system) {
       requestData.system_instruction = {
         parts: [{ text: system }]
@@ -127,24 +116,24 @@ app.post('/api/chat', async (req, res) => {
     );
 
     if (!geminiRes.ok) {
-      const err = await geminiRes.text();
-      console.error('Gemini error detailed:', err);
-      return res.status(502).json({ error: 'Gemini API error', detail: err });
+      const errText = await geminiRes.text();
+      console.error('Gemini API Error:', errText);
+      return res.status(502).json({ error: 'Gemini API Error', detail: errText });
     }
 
     const data = await geminiRes.json();
     
-    // Safety check: ensure candidates exist before accessing
+    // Safety check for response content
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
     
     if (!text) {
-      console.warn('Gemini returned an empty response or blocked content.');
-      return res.json({ text: "I'm sorry, I can't generate a response to that right now." });
+      return res.json({ text: "I'm sorry, I'm having trouble thinking of a response. Can you try rephrasing?" });
     }
 
     res.json({ text });
+
   } catch (e) {
-    console.error('Server error:', e);
+    console.error('Server Error:', e);
     res.status(500).json({ error: e.message });
   }
 });
