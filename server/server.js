@@ -104,10 +104,10 @@ app.post('/api/chat', async (req, res) => {
     // Prepare the request body
     const requestData = {
       contents,
-      generationConfig: { 
-        maxOutputTokens: 240, 
-        temperature: 0.9 
-      }
+     generationConfig: { 
+  maxOutputTokens: 1024, // Increased from 240
+  temperature: 0.9 
+}
     };
 
     // Use the official system_instruction field instead of injecting into conversation
