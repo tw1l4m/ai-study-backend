@@ -33,14 +33,11 @@ app.get('/', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString()
 // Find one user
 app.post('/api/users/find', async (req, res) => {
   try {
-    console.log("BODY RECEIVED:", req.body);
-
     const db = await getDb();
     const user = await db.collection('users').findOne({ email: req.body.email });
-
     res.json({ document: user || null });
   } catch (e) {
-    console.error("ERROR:", e);
+    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
