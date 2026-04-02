@@ -1,3 +1,4 @@
+require('dotenv').config(); // Load environment variables
 const express = require('express');
 const cors = require('cors');
 const { MongoClient } = require('mongodb');
@@ -27,10 +28,9 @@ async function getDb() {
 app.get('/', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 
 // ═══════════════════════════════════════════════
-//  MONGO ROUTES
+//  MONGO ROUTES (Keep your existing routes)
 // ═══════════════════════════════════════════════
 
-// Find one user
 app.post('/api/users/find', async (req, res) => {
   try {
     const db = await getDb();
@@ -42,7 +42,6 @@ app.post('/api/users/find', async (req, res) => {
   }
 });
 
-// Insert user
 app.post('/api/users/insert', async (req, res) => {
   try {
     const db = await getDb();
@@ -54,7 +53,6 @@ app.post('/api/users/insert', async (req, res) => {
   }
 });
 
-// Update user
 app.post('/api/users/update', async (req, res) => {
   try {
     const db = await getDb();
@@ -67,7 +65,6 @@ app.post('/api/users/update', async (req, res) => {
   }
 });
 
-// Insert participant
 app.post('/api/participants/insert', async (req, res) => {
   try {
     const db = await getDb();
@@ -79,7 +76,6 @@ app.post('/api/participants/insert', async (req, res) => {
   }
 });
 
-// Update participant
 app.post('/api/participants/update', async (req, res) => {
   try {
     const db = await getDb();
@@ -93,49 +89,62 @@ app.post('/api/participants/update', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════
-//  GEMINI CHAT ROUTE
+//  FIXED GEMINI CHAT ROUTE
 // ═══════════════════════════════════════════════
 app.post('/api/chat', async (req, res) => {
   try {
     const { system, messages } = req.body;
 
-    // Build Gemini-compatible request
-    // Convert from Anthropic format to Gemini format
-    const geminiMessages = messages.map(m => ({
+    // Convert messages to Gemini format (strictly user/model)
+    const contents = messages.map(m => ({
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }]
     }));
 
-    // Add system as first user message if provided
-    const contents = system
-      ? [{ role: 'user', parts: [{ text: `[SYSTEM INSTRUCTIONS]\n${system}\n[END SYSTEM]` }] },
-         { role: 'model', parts: [{ text: 'Understood. I will follow these instructions.' }] },
-         ...geminiMessages]
-      : geminiMessages;
+    // Prepare the request body
+    const requestData = {
+      contents,
+      generationConfig: { 
+        maxOutputTokens: 240, 
+        temperature: 0.9 
+      }
+    };
+
+    // Use the official system_instruction field instead of injecting into conversation
+    if (system) {
+      requestData.system_instruction = {
+        parts: [{ text: system }]
+      };
+    }
 
     const geminiRes = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents,
-          generationConfig: { maxOutputTokens: 240, temperature: 0.9 }
-        })
+        body: JSON.stringify(requestData)
       }
     );
 
     if (!geminiRes.ok) {
       const err = await geminiRes.text();
-      console.error('Gemini error:', err);
+      console.error('Gemini error detailed:', err);
       return res.status(502).json({ error: 'Gemini API error', detail: err });
     }
 
     const data = await geminiRes.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+    
+    // Safety check: ensure candidates exist before accessing
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    
+    if (!text) {
+      console.warn('Gemini returned an empty response or blocked content.');
+      return res.json({ text: "I'm sorry, I can't generate a response to that right now." });
+    }
+
     res.json({ text });
   } catch (e) {
-    console.error(e);
+    console.error('Server error:', e);
     res.status(500).json({ error: e.message });
   }
 });
