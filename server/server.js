@@ -1,4 +1,3 @@
-require('dotenv').config(); 
 const express = require('express');
 const cors = require('cors');
 const { MongoClient } = require('mongodb');
@@ -7,13 +6,13 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(cors({ origin: '*' }));
 
-// ── CONFIGURATION ────────────────────────────────
+// ── ENV ──────────────────────────────────────────
 const MONGO_URI   = process.env.MONGO_URI   || '';
 const GEMINI_KEY  = process.env.GEMINI_KEY  || '';
 const MONGO_DB    = process.env.MONGO_DB    || 'ai_study';
 const PORT        = process.env.PORT        || 3000;
 
-// ── MONGODB CONNECTION ───────────────────────────
+// ── MongoDB singleton ────────────────────────────
 let _db = null;
 async function getDb() {
   if (_db) return _db;
@@ -24,30 +23,38 @@ async function getDb() {
   return _db;
 }
 
-// ── HEALTH CHECK ─────────────────────────────────
+// ── Health check ─────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 
-// ── DATABASE ROUTES ──────────────────────────────
+// ═══════════════════════════════════════════════
+//  MONGO ROUTES
+// ═══════════════════════════════════════════════
+
+// Find one user
 app.post('/api/users/find', async (req, res) => {
   try {
     const db = await getDb();
     const user = await db.collection('users').findOne({ email: req.body.email });
     res.json({ document: user || null });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
+// Insert user
 app.post('/api/users/insert', async (req, res) => {
   try {
     const db = await getDb();
     const result = await db.collection('users').insertOne(req.body.document);
     res.json({ insertedId: result.insertedId });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
+// Update user
 app.post('/api/users/update', async (req, res) => {
   try {
     const db = await getDb();
@@ -55,20 +62,24 @@ app.post('/api/users/update', async (req, res) => {
     const result = await db.collection('users').updateOne(filter, update);
     res.json({ matchedCount: result.matchedCount, modifiedCount: result.modifiedCount });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
+// Insert participant
 app.post('/api/participants/insert', async (req, res) => {
   try {
     const db = await getDb();
     const result = await db.collection('participants').insertOne(req.body.document);
     res.json({ insertedId: result.insertedId });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
+// Update participant
 app.post('/api/participants/update', async (req, res) => {
   try {
     const db = await getDb();
@@ -76,64 +87,55 @@ app.post('/api/participants/update', async (req, res) => {
     const result = await db.collection('participants').updateOne(filter, update);
     res.json({ matchedCount: result.matchedCount, modifiedCount: result.modifiedCount });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── AI CHAT ROUTE (OPTIMIZED FOR HUMAN CHAT) ─────
+// ═══════════════════════════════════════════════
+//  GEMINI CHAT ROUTE
+// ═══════════════════════════════════════════════
 app.post('/api/chat', async (req, res) => {
   try {
     const { system, messages } = req.body;
 
-    // Convert messages to Gemini's user/model format
-    const contents = messages.map(m => ({
+    // Build Gemini-compatible request
+    // Convert from Anthropic format to Gemini format
+    const geminiMessages = messages.map(m => ({
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }]
     }));
 
-    const requestData = {
-      contents,
-      generationConfig: { 
-        maxOutputTokens: 1024, // High enough to avoid mid-sentence cut-offs
-        temperature: 1.2,      // Higher = more human-like and creative
-        topP: 0.95,            // Diversifies word choice for less robotic chat
-        topK: 64
-      }
-    };
-
-    // Use the official system_instruction field for better persona stickiness
-    if (system) {
-      requestData.system_instruction = {
-        parts: [{ text: system }]
-      };
-    }
+    // Add system as first user message if provided
+    const contents = system
+      ? [{ role: 'user', parts: [{ text: `[SYSTEM INSTRUCTIONS]\n${system}\n[END SYSTEM]` }] },
+         { role: 'model', parts: [{ text: 'Understood. I will follow these instructions.' }] },
+         ...geminiMessages]
+      : geminiMessages;
 
     const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestData)
+        body: JSON.stringify({
+          contents,
+          generationConfig: { maxOutputTokens: 240, temperature: 0.9 }
+        })
       }
     );
 
     if (!geminiRes.ok) {
-      const errText = await geminiRes.text();
-      console.error('Gemini Error:', errText);
-      return res.status(502).json({ error: 'AI unavailable', detail: errText });
+      const err = await geminiRes.text();
+      console.error('Gemini error:', err);
+      return res.status(502).json({ error: 'Gemini API error', detail: err });
     }
 
     const data = await geminiRes.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    
-    if (!text) {
-      return res.json({ text: "I'm not quite sure how to respond to that. Could you tell me more?" });
-    }
-
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
     res.json({ text });
-
   } catch (e) {
-    console.error('Server Error:', e);
+    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
