@@ -13,7 +13,7 @@ const MONGO_DB       = process.env.MONGO_DB       || 'ai_study';
 const PORT           = process.env.PORT           || 3000;
 
 // Model — good free tier on OpenRouter, smart enough for debate
-const AI_MODEL = 'google/gemini-2.0-flash-exp:free'; // 100% free, no credits needed
+const AI_MODEL = 'google/gemini-2.5-flash-exp:free'; // 100% free, no credits needed
 
 let _db = null;
 async function getDb() {
