@@ -7,13 +7,13 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(cors({ origin: '*' }));
 
-const MONGO_URI        = process.env.MONGO_URI        || '';
-const OPENROUTER_KEY   = process.env.OPENROUTER_KEY   || '';
-const MONGO_DB         = process.env.MONGO_DB         || 'ai_study';
-const PORT             = process.env.PORT             || 3000;
+const MONGO_URI      = process.env.MONGO_URI      || '';
+const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
+const MONGO_DB       = process.env.MONGO_DB       || 'ai_study';
+const PORT           = process.env.PORT           || 3000;
 
-// Best free/cheap model on OpenRouter for chat — change if you want
-const AI_MODEL = 'meta-llama/llama-3.3-70b-instruct';
+// Model — good free tier on OpenRouter, smart enough for debate
+const AI_MODEL = 'google/gemini-2.0-flash-exp:free'; // 100% free, no credits needed
 
 let _db = null;
 async function getDb() {
@@ -24,15 +24,19 @@ async function getDb() {
   console.log('MongoDB connected');
   return _db;
 }
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── HEALTH CHECK ─────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
+// ── HEALTH (also shows config status) ────────────────────────
+app.get('/', (req, res) => res.json({
+  status: 'ok',
+  ts: new Date().toISOString(),
+  openrouter_key_set: !!OPENROUTER_KEY,
+  mongo_uri_set: !!MONGO_URI
+}));
 
-// ── DATABASE ROUTES ──────────────────────────────
+// ── DB ROUTES ────────────────────────────────────────────────
 app.post('/api/users/find', async (req, res) => {
-  try { const db=await getDb(); const user=await db.collection('users').findOne({email:req.body.email}); res.json({document:user||null}); }
+  try { const db=await getDb(); res.json({document: await db.collection('users').findOne({email:req.body.email})||null}); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/users/insert', async (req, res) => {
@@ -40,7 +44,7 @@ app.post('/api/users/insert', async (req, res) => {
   catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/users/update', async (req, res) => {
-  try { const db=await getDb(); const {filter,update}=req.body; const r=await db.collection('users').updateOne(filter,update); res.json({matchedCount:r.matchedCount,modifiedCount:r.modifiedCount}); }
+  try { const db=await getDb(); const r=await db.collection('users').updateOne(req.body.filter,req.body.update); res.json({matchedCount:r.matchedCount}); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/participants/insert', async (req, res) => {
@@ -48,22 +52,35 @@ app.post('/api/participants/insert', async (req, res) => {
   catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/participants/update', async (req, res) => {
-  try { const db=await getDb(); const {filter,update}=req.body; const r=await db.collection('participants').updateOne(filter,update); res.json({matchedCount:r.matchedCount,modifiedCount:r.modifiedCount}); }
+  try { const db=await getDb(); const r=await db.collection('participants').updateOne(req.body.filter,req.body.update); res.json({matchedCount:r.matchedCount}); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
 
-// ── AI CHAT (OpenRouter — OpenAI-compatible) ─────
+// ── AI CHAT ──────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
+
+  // ── DIAGNOSTIC: log what we receive ──
+  console.log('=== /api/chat called ===');
+  console.log('OPENROUTER_KEY set:', !!OPENROUTER_KEY, '| key prefix:', OPENROUTER_KEY.slice(0,12));
+  console.log('messages count:', req.body.messages?.length);
+  console.log('system length:', req.body.system?.length);
+
   try {
     const { system, messages } = req.body;
 
-    // OpenRouter uses OpenAI format: [{role, content}]
-    // System prompt goes as first message with role "system"
+    if (!OPENROUTER_KEY) {
+      console.error('OPENROUTER_KEY is not set!');
+      return res.json({ text: "Server configuration error: OPENROUTER_KEY missing." });
+    }
+
+    // Build OpenAI-format messages
     const openaiMessages = [];
     if (system) openaiMessages.push({ role: 'system', content: system });
     for (const m of messages) {
       openaiMessages.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content });
     }
+
+    console.log('Sending to OpenRouter, total messages:', openaiMessages.length);
 
     let text = '';
     let lastError = '';
@@ -87,41 +104,38 @@ app.post('/api/chat', async (req, res) => {
           })
         });
 
+        const responseText = await response.text();
+        console.log(`Attempt ${attempt} — HTTP ${response.status} — body:`, responseText.slice(0, 400));
+
         if (!response.ok) {
-          lastError = await response.text();
-          console.error(`OpenRouter attempt ${attempt} HTTP ${response.status}:`, lastError.slice(0, 300));
+          lastError = responseText;
           if (attempt < 3) { await sleep(attempt * 800); continue; }
           break;
         }
 
-        const data = await response.json();
+        const data = JSON.parse(responseText);
         const raw = data.choices?.[0]?.message?.content?.trim() || '';
 
         if (!raw) {
-          console.warn(`Attempt ${attempt}: empty response`);
+          console.warn(`Attempt ${attempt}: empty content in response`);
+          lastError = 'empty content';
           if (attempt < 3) { await sleep(800); continue; }
           break;
         }
 
-        // Clean any accidental [Name]: prefix the model might echo
-        text = raw
-          .replace(/^\[[^\]]+\]\s*:?\s*/, '')
-          .replace(/^\w[\w_]+\s*:\s*/, '')
-          .trim();
+        // Strip accidental [Name]: prefix
+        text = raw.replace(/^\[[^\]]+\]\s*:?\s*/, '').replace(/^\w[\w_]+\s*:\s*/, '').trim();
 
-        // If response ends mid-sentence, trim to last complete sentence
-        if (text && !(/[.!?…،؟]$/.test(text))) {
-          const lastPunct = Math.max(
-            text.lastIndexOf('.'), text.lastIndexOf('!'),
-            text.lastIndexOf('?'), text.lastIndexOf('…'),
-            text.lastIndexOf('،'), text.lastIndexOf('؟')
-          );
-          if (lastPunct > text.length * 0.4) {
-            text = text.substring(0, lastPunct + 1).trim();
-          }
+        // Trim to last complete sentence if cut mid-sentence
+        if (!(/[.!?…،؟]$/.test(text))) {
+          const last = Math.max(text.lastIndexOf('.'), text.lastIndexOf('!'), text.lastIndexOf('?'), text.lastIndexOf('؟'));
+          if (last > text.length * 0.4) text = text.substring(0, last + 1).trim();
         }
 
-        if (text) break;
+        if (text) {
+          console.log('SUCCESS — reply:', text.slice(0, 100));
+          break;
+        }
 
       } catch (fetchErr) {
         lastError = fetchErr.message;
@@ -130,23 +144,18 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
-    // In-character fallbacks — never expose a technical error to the user
     if (!text) {
-      const fallbacks = [
-        "That's an interesting take — what specifically makes you think that?",
-        "Fair point. But have you considered what students actually lose when they rely only on AI?",
-        "I'd need to think about that more. What's your main argument here?"
-      ];
-      text = fallbacks[Math.floor(Math.random() * fallbacks.length)];
-      console.warn('All OpenRouter attempts failed. Last error:', lastError.slice(0, 200));
+      console.error('ALL ATTEMPTS FAILED. Last error:', lastError.slice(0, 300));
+      // Return the actual error so you can debug — remove this in production
+      return res.json({ text: `[DEBUG] OpenRouter failed: ${lastError.slice(0, 150)}` });
     }
 
     res.json({ text });
 
   } catch (e) {
-    console.error('Server Error:', e);
-    res.json({ text: "That's an interesting take — what specifically makes you think that?" });
+    console.error('Server crash:', e);
+    res.json({ text: `[DEBUG] Server error: ${e.message}` });
   }
 });
 
-app.listen(PORT, () => console.log(`Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server on port ${PORT} | OpenRouter key set: ${!!OPENROUTER_KEY}`));
