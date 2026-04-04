@@ -92,9 +92,9 @@ app.post('/api/chat', async (req, res) => {
           body: JSON.stringify({
             model: AI_MODEL,
             messages: openaiMessages,
-            max_tokens: 200,
-            temperature: 1.0,
-            top_p: 0.92,
+            max_tokens: 350,   // Arabic needs more tokens per sentence than English
+            temperature: 0.85, // slightly lower = less corruption artifacts
+            top_p: 0.90,
             stream: false
           })
         });
@@ -117,17 +117,27 @@ app.post('/api/chat', async (req, res) => {
           break;
         }
 
-        // Strip accidental [Name]: prefix the model might echo
+        // Strip accidental [Name]: prefix
         text = raw
           .replace(/^\[[^\]]+\]\s*:?\s*/, '')
           .replace(/^\w[\w_]+\s*:\s*/, '')
+          .trim();
+
+        // Remove corrupted tokens: lone Latin letters/numbers mixed into Arabic text
+        // e.g. "تعتبر6٪بة" or "buie" artifacts from Llama tokenizer
+        text = text
+          .replace(/[a-zA-Z]{1,4}(?=[\u0600-\u06FF])/g, '') // Latin before Arabic
+          .replace(/(?<=[\u0600-\u06FF])[a-zA-Z]{1,4}/g, '') // Latin after Arabic
+          .replace(/\d+[٪%][a-zA-Z]*/g, '')                   // number+percent artifacts
+          .replace(/  +/g, ' ')                                 // collapse double spaces
           .trim();
 
         // Trim to last complete sentence if cut mid-sentence
         if (text && !(/[.!?…،؟]$/.test(text))) {
           const last = Math.max(
             text.lastIndexOf('.'), text.lastIndexOf('!'),
-            text.lastIndexOf('?'), text.lastIndexOf('؟')
+            text.lastIndexOf('?'), text.lastIndexOf('؟'),
+            text.lastIndexOf('،')
           );
           if (last > text.length * 0.4) text = text.substring(0, last + 1).trim();
         }
