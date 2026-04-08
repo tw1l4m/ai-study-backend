@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MongoClient } = require('mongodb');
@@ -7,169 +6,113 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(cors({ origin: '*' }));
 
-const MONGO_URI    = process.env.MONGO_URI    || '';
-const NVIDIA_KEY   = process.env.NVIDIA_KEY   || '';
-const MONGO_DB     = process.env.MONGO_DB     || 'ai_study';
-const PORT         = process.env.PORT         || 3000;
+// ── ENV ──────────────────────────────────────────
+const MONGO_URI  = process.env.MONGO_URI  || '';
+const NVIDIA_KEY = process.env.NVIDIA_KEY || '';   // ← changed
+const MONGO_DB   = process.env.MONGO_DB   || 'ai_study';
+const PORT       = process.env.PORT       || 3000;
 
-// NVIDIA Build — free 1000 credits on signup, excellent models
-const NVIDIA_BASE  = 'https://integrate.api.nvidia.com/v1';
-const AI_MODEL     = 'meta/llama-3.3-70b-instruct'; // best for chat
-
+// ── MongoDB singleton ────────────────────────────
 let _db = null;
 async function getDb() {
   if (_db) return _db;
   const client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
   await client.connect();
   _db = client.db(MONGO_DB);
-  console.log('MongoDB connected');
+  console.log('✅ MongoDB connected');
   return _db;
 }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── HEALTH ───────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({
-  status: 'ok',
-  ts: new Date().toISOString(),
-  nvidia_key_set: !!NVIDIA_KEY,
-  mongo_uri_set: !!MONGO_URI
-}));
+// ── Health check ─────────────────────────────────
+app.get('/', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 
-// ── DB ROUTES ────────────────────────────────────────────────
+// ═══════════════════════════════════════════════
+//  MONGO ROUTES  (unchanged)
+// ═══════════════════════════════════════════════
 app.post('/api/users/find', async (req, res) => {
-  try { const db=await getDb(); res.json({document: await db.collection('users').findOne({email:req.body.email})||null}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  try {
+    const db = await getDb();
+    const user = await db.collection('users').findOne({ email: req.body.email });
+    res.json({ document: user || null });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
+
 app.post('/api/users/insert', async (req, res) => {
-  try { const db=await getDb(); const r=await db.collection('users').insertOne(req.body.document); res.json({insertedId:r.insertedId}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  try {
+    const db = await getDb();
+    const result = await db.collection('users').insertOne(req.body.document);
+    res.json({ insertedId: result.insertedId });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
+
 app.post('/api/users/update', async (req, res) => {
-  try { const db=await getDb(); const r=await db.collection('users').updateOne(req.body.filter,req.body.update); res.json({matchedCount:r.matchedCount}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  try {
+    const db = await getDb();
+    const { filter, update } = req.body;
+    const result = await db.collection('users').updateOne(filter, update);
+    res.json({ matchedCount: result.matchedCount, modifiedCount: result.modifiedCount });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
+
 app.post('/api/participants/insert', async (req, res) => {
-  try { const db=await getDb(); const r=await db.collection('participants').insertOne(req.body.document); res.json({insertedId:r.insertedId}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  try {
+    const db = await getDb();
+    const result = await db.collection('participants').insertOne(req.body.document);
+    res.json({ insertedId: result.insertedId });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
+
 app.post('/api/participants/update', async (req, res) => {
-  try { const db=await getDb(); const r=await db.collection('participants').updateOne(req.body.filter,req.body.update); res.json({matchedCount:r.matchedCount}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  try {
+    const db = await getDb();
+    const { filter, update } = req.body;
+    const result = await db.collection('participants').updateOne(filter, update);
+    res.json({ matchedCount: result.matchedCount, modifiedCount: result.modifiedCount });
+  } catch (e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
-// ── AI CHAT (NVIDIA Build API) ───────────────────────────────
+// ═══════════════════════════════════════════════
+//  NVIDIA CHAT ROUTE
+// ═══════════════════════════════════════════════
 app.post('/api/chat', async (req, res) => {
-  console.log('=== /api/chat called | NVIDIA key set:', !!NVIDIA_KEY);
-
   try {
     const { system, messages } = req.body;
 
-    if (!NVIDIA_KEY) {
-      console.error('NVIDIA_KEY not set!');
-      return res.json({ text: "Server configuration error: NVIDIA_KEY missing." });
-    }
-
-    // OpenAI-compatible format
+    // NVIDIA uses OpenAI-compatible format — native system role support
     const openaiMessages = [];
     if (system) openaiMessages.push({ role: 'system', content: system });
-    for (const m of messages) {
-      openaiMessages.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content });
-    }
+    openaiMessages.push(...messages);
 
-    let text = '';
-    let lastError = '';
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        console.log(`Attempt ${attempt} — model: ${AI_MODEL}`);
-
-        const response = await fetch(`${NVIDIA_BASE}/chat/completions`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${NVIDIA_KEY}`
-          },
-          body: JSON.stringify({
-            model: AI_MODEL,
-            messages: openaiMessages,
-            max_tokens: 350,   // Arabic needs more tokens per sentence than English
-            temperature: 0.85, // slightly lower = less corruption artifacts
-            top_p: 0.90,
-            stream: false
-          })
-        });
-
-        const responseText = await response.text();
-        console.log(`Attempt ${attempt} HTTP ${response.status}:`, responseText.slice(0, 300));
-
-        if (!response.ok) {
-          lastError = responseText;
-          if (attempt < 3) { await sleep(attempt * 800); continue; }
-          break;
-        }
-
-        const data = JSON.parse(responseText);
-        const raw = data.choices?.[0]?.message?.content?.trim() || '';
-
-        if (!raw) {
-          lastError = 'empty response';
-          if (attempt < 3) { await sleep(800); continue; }
-          break;
-        }
-
-        // Strip accidental [Name]: prefix
-        text = raw
-          .replace(/^\[[^\]]+\]\s*:?\s*/, '')
-          .replace(/^\w[\w_]+\s*:\s*/, '')
-          .trim();
-
-        // Remove corrupted tokens: lone Latin letters/numbers mixed into Arabic text
-        // e.g. "تعتبر6٪بة" or "buie" artifacts from Llama tokenizer
-        text = text
-          .replace(/[a-zA-Z]{1,4}(?=[\u0600-\u06FF])/g, '') // Latin before Arabic
-          .replace(/(?<=[\u0600-\u06FF])[a-zA-Z]{1,4}/g, '') // Latin after Arabic
-          .replace(/\d+[٪%][a-zA-Z]*/g, '')                   // number+percent artifacts
-          .replace(/  +/g, ' ')                                 // collapse double spaces
-          .trim();
-
-        // Trim to last complete sentence if cut mid-sentence
-        if (text && !(/[.!?…،؟]$/.test(text))) {
-          const last = Math.max(
-            text.lastIndexOf('.'), text.lastIndexOf('!'),
-            text.lastIndexOf('?'), text.lastIndexOf('؟'),
-            text.lastIndexOf('،')
-          );
-          if (last > text.length * 0.4) text = text.substring(0, last + 1).trim();
-        }
-
-        if (text) {
-          console.log('SUCCESS:', text.slice(0, 120));
-          break;
-        }
-
-      } catch (fetchErr) {
-        lastError = fetchErr.message;
-        console.error(`Attempt ${attempt} error:`, fetchErr.message);
-        if (attempt < 3) await sleep(attempt * 800);
+    const nvRes = await fetch(
+      'https://integrate.api.nvidia.com/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${NVIDIA_KEY}`
+        },
+        body: JSON.stringify({
+          model: 'meta/llama-3.1-8b-instruct',  // swap model slug as needed
+          messages: openaiMessages,
+          max_tokens: 240,
+          temperature: 0.9
+        })
       }
+    );
+
+    if (!nvRes.ok) {
+      const err = await nvRes.text();
+      console.error('NVIDIA error:', err);
+      return res.status(502).json({ error: 'NVIDIA API error', detail: err });
     }
 
-    if (!text) {
-      console.error('All attempts failed. Last error:', lastError.slice(0, 300));
-      const fallbacks = [
-        "That's an interesting take — what specifically makes you think that?",
-        "Fair point. But have you considered what students actually lose when they rely only on AI?",
-        "I'd need to think about that more. What's your main argument here?"
-      ];
-      text = fallbacks[Math.floor(Math.random() * fallbacks.length)];
-    }
-
+    const data = await nvRes.json();
+    const text = data.choices?.[0]?.message?.content?.trim() || '';
     res.json({ text });
-
   } catch (e) {
-    console.error('Server crash:', e);
-    res.json({ text: "That's an interesting take — what specifically makes you think that?" });
+    console.error(e);
+    res.status(500).json({ error: e.message });
   }
 });
 
-app.listen(PORT, () => console.log(`Server on port ${PORT} | NVIDIA key set: ${!!NVIDIA_KEY}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
