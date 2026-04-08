@@ -146,15 +146,25 @@ app.post('/api/chat', async (req, res) => {
         let raw = data.choices?.[0]?.message?.content?.trim() || '';
         if (!raw) { lastError = 'empty'; continue; }
 
-        // ── Step 4: Clean Arabic corruption artifacts ──
+        // ── Step 4: Deep clean Arabic corruption artifacts ──
         raw = raw
-          .replace(/^\[[^\]]+\]\s*:?\s*/, '')     // remove [Name]: prefix
-          .replace(/^\w[\w_]+\s*:\s*/, '')          // remove Name: prefix
-          .replace(/[a-zA-Z]{1,3}(?=[\u0600-\u06FF])/g, '')   // Latin before Arabic chars
-          .replace(/(?<=[\u0600-\u06FF])[a-zA-Z]{1,3}/g, '')  // Latin after Arabic chars
-          .replace(/\d+[٪%][a-zA-Z]*/g, '')         // number+percent artifacts
-          .replace(/\*+/g, '')                       // markdown asterisks
-          .replace(/  +/g, ' ')
+          .replace(/^\[[^\]]+\]\s*:?\s*/, '')       // [Name]: prefix
+          .replace(/^\w[\w_]+\s*:\s*/, '')            // Name: prefix
+          .replace(/\*+/g, '')                         // markdown asterisks
+
+          // Remove entire tokens that mix Latin + Arabic scripts (e.g. 'balaلاعة')
+          .replace(/\S*[a-zA-Z]+[\u0600-\u06FF]\S*/g, '')
+          .replace(/\S*[\u0600-\u06FF]+[a-zA-Z]\S*/g, '')
+
+          // Remove isolated Latin words inside Arabic text
+          .replace(/(?<=[\u0600-\u06FF\s،؟!.])[a-zA-Z]{1,8}(?=[\u0600-\u06FF\s،؟!.])/g, '')
+
+          // number+digit artifacts embedded in Arabic (e.g. 'تعتبر6٪بة')
+          .replace(/[\u0600-\u06FF]+\d+[\u066A%]?[\u0600-\u06FF]*/g, m => m.replace(/\d+[\u066A%]?/g, ''))
+          .replace(/\d+[\u066A%][a-zA-Z]*/g, '')
+
+          // Collapse spaces left by removals
+          .replace(/\s{2,}/g, ' ')
           .trim();
 
         // If ends mid-sentence, trim to last complete sentence
