@@ -133,16 +133,41 @@ app.get('/api/admin/participant/:pid', adminAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── RECENT REPLIES STORE (in-memory, per session) ────────────
+// Keyed by participant_id or a hash of the system prompt first 40 chars
+// Stores the last 6 bot replies so we can inject "don't repeat" instructions
+const recentReplies = new Map();
+function getSessionKey(system) {
+  // Use first 60 chars of system prompt as a session fingerprint
+  return (system || '').substring(0, 60).replace(/\s+/g, '_');
+}
+function recordReply(key, text) {
+  if (!recentReplies.has(key)) recentReplies.set(key, []);
+  const arr = recentReplies.get(key);
+  arr.push(text);
+  if (arr.length > 6) arr.shift();
+}
+function getAntiRepeat(key) {
+  const arr = recentReplies.get(key) || [];
+  if (arr.length === 0) return '';
+  const quoted = arr.map(t => `"${t.substring(0, 60)}..."`).join('\n');
+  return `\n\nANTI-REPETITION — you recently said these things. Do NOT repeat the same phrasing, questions, or ideas:\n${quoted}\nYour next response must be clearly different in wording AND substance.`;
+}
+
 // ── AI CHAT ──────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
   try {
     const { system, messages } = req.body;
     if (!NVIDIA_KEY) return res.json({ text: 'NVIDIA_KEY not configured.' });
 
+    const sessionKey = getSessionKey(system);
+    const antiRepeat = getAntiRepeat(sessionKey);
+
     // Keep FULL system prompt — do NOT compress for research integrity
     // The contradictions and personalized questions are the core of the study
     const openaiMessages = [];
-    if (system) openaiMessages.push({ role: 'system', content: system });
+    // Inject anti-repetition into system prompt
+    if (system) openaiMessages.push({ role: 'system', content: system + antiRepeat });
 
     // Cap history to last 8 messages (4 exchanges) to prevent context overflow
     const history = (messages || []).slice(-8).map(m => ({
@@ -211,7 +236,7 @@ app.post('/api/chat', async (req, res) => {
           if (last > raw.length * 0.4) raw = raw.substring(0, last + 1).trim();
         }
 
-        if (raw) { text = raw; console.log('OK:', text.slice(0, 80)); break; }
+        if (raw) { text = raw; recordReply(sessionKey, raw); console.log('OK:', text.slice(0, 80)); break; }
 
       } catch (err) {
         lastError = err.message;
