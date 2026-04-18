@@ -1,29 +1,27 @@
-server.js 
-
-
-
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
+const cors    = require('cors');
 const { MongoClient } = require('mongodb');
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '2mb', type: ['application/json', 'text/plain'] }));
+app.use((req, res, next) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  next();
+});
 app.use(cors({ origin: '*' }));
 
-const MONGO_URI  = process.env.MONGO_URI  || '';
-const NVIDIA_KEY = process.env.NVIDIA_KEY || '';
-const MONGO_DB   = process.env.MONGO_DB   || 'ai_study';
-const PORT       = process.env.PORT       || 3000;
+const MONGO_URI   = process.env.MONGO_URI   || '';
+const NVIDIA_KEY  = process.env.NVIDIA_KEY  || '';
+const ADMIN_PASS  = process.env.ADMIN_PASS  || 'admin2024';
+const MONGO_DB    = process.env.MONGO_DB    || 'ai_study';
+const PORT        = process.env.PORT        || 3000;
 
 const NVIDIA_BASE = 'https://integrate.api.nvidia.com/v1';
-
-// Model priority list — server tries each in order if previous fails
-// mistral-large is excellent in Arabic, nemotron as fallback
 const MODELS = [
-  'mistralai/mistral-large-2-instruct',   // best Arabic quality on NVIDIA
-  'meta/llama-3.1-405b-instruct',         // fallback — larger = better Arabic
-  'meta/llama-3.3-70b-instruct'           // last resort
+  'mistralai/mistral-large-2-instruct',
+  'meta/llama-3.1-405b-instruct',
+  'meta/llama-3.3-70b-instruct'
 ];
 
 let _db = null;
@@ -39,11 +37,8 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── HEALTH ───────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
-  status: 'ok',
-  ts: new Date().toISOString(),
-  nvidia_key_set: !!NVIDIA_KEY,
-  mongo_uri_set: !!MONGO_URI,
-  primary_model: MODELS[0]
+  status: 'ok', ts: new Date().toISOString(),
+  nvidia_key_set: !!NVIDIA_KEY, mongo_uri_set: !!MONGO_URI
 }));
 
 // ── DB ROUTES ────────────────────────────────────────────────
@@ -68,54 +63,97 @@ app.post('/api/participants/update', async (req, res) => {
   catch(e){ res.status(500).json({error:e.message}); }
 });
 
+// ── ADMIN ROUTES ─────────────────────────────────────────────
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body;
+  if (password === ADMIN_PASS) {
+    res.json({ ok: true, token: Buffer.from(ADMIN_PASS + ':admin').toString('base64') });
+  } else {
+    res.status(401).json({ ok: false, error: 'Wrong password' });
+  }
+});
+
+function adminAuth(req, res, next) {
+  const token = req.headers['x-admin-token'] || '';
+  const expected = Buffer.from(ADMIN_PASS + ':admin').toString('base64');
+  if (token === expected) return next();
+  res.status(401).json({ error: 'Unauthorized' });
+}
+
+// All participants — full data
+app.get('/api/admin/participants', adminAuth, async (req, res) => {
+  try {
+    const db = await getDb();
+    const participants = await db.collection('participants')
+      .find({}).sort({ created_at: -1 }).limit(200).toArray();
+    res.json({ participants });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// All users — account info
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+  try {
+    const db = await getDb();
+    const users = await db.collection('users')
+      .find({}, { projection: { passwordHash: 0 } })
+      .sort({ createdAt: -1 }).limit(200).toArray();
+    res.json({ users });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Stats summary
+app.get('/api/admin/stats', adminAuth, async (req, res) => {
+  try {
+    const db = await getDb();
+    const total       = await db.collection('participants').countDocuments();
+    const completed   = await db.collection('participants').countDocuments({ completed_at: { $exists: true } });
+    const totalUsers  = await db.collection('users').countDocuments();
+    const stances     = await db.collection('participants').aggregate([
+      { $group: { _id: '$detected_stance', count: { $sum: 1 } } }
+    ]).toArray();
+    // Opinion shift: avg(post_avg - pre_avg) for completed participants
+    const shifts = await db.collection('participants').aggregate([
+      { $match: { pre_avg: { $exists: true }, post_avg: { $exists: true } } },
+      { $group: { _id: null, avgShift: { $avg: { $subtract: ['$post_avg', '$pre_avg'] } }, count: { $sum: 1 } } }
+    ]).toArray();
+    // Active in last 30min
+    const since = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const active = await db.collection('participants').countDocuments({ created_at: { $gte: since } });
+    res.json({ total, completed, totalUsers, stances, shifts: shifts[0] || {}, active });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Single participant detail
+app.get('/api/admin/participant/:pid', adminAuth, async (req, res) => {
+  try {
+    const db = await getDb();
+    const p = await db.collection('participants').findOne({ participant_id: req.params.pid });
+    if (!p) return res.status(404).json({ error: 'Not found' });
+    res.json({ participant: p });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── AI CHAT ──────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
   try {
     const { system, messages } = req.body;
+    if (!NVIDIA_KEY) return res.json({ text: 'NVIDIA_KEY not configured.' });
 
-    if (!NVIDIA_KEY) return res.json({ text: 'NVIDIA_KEY not configured on server.' });
+    // Keep FULL system prompt — do NOT compress for research integrity
+    // The contradictions and personalized questions are the core of the study
+    const openaiMessages = [];
+    if (system) openaiMessages.push({ role: 'system', content: system });
 
-    // ── Step 1: Compress system prompt (~800 tokens → ~250) ──
-    let compactSystem = system || '';
-    if (system && system.length > 600) {
-      const portraitStart  = system.indexOf('PSYCHOLOGICAL PORTRAIT:');
-      const rawDataStart   = system.indexOf('RAW DATA');
-      const strategyStart  = system.indexOf('STRATEGY');
-      const endStart       = system.indexOf('=== END');
-      const contraStart    = system.indexOf('INTERNAL CONTRADICTIONS');
-
-      const portrait = portraitStart >= 0 && rawDataStart > portraitStart
-        ? system.slice(portraitStart + 24, rawDataStart).trim() : '';
-      const strategy = strategyStart >= 0 && endStart > strategyStart
-        ? system.slice(strategyStart, endStart).replace(/^STRATEGY[^\n]*\n/, '').trim() : '';
-      const contradictions = contraStart >= 0 && strategyStart > contraStart
-        ? system.slice(contraStart, strategyStart)
-            .replace('INTERNAL CONTRADICTIONS — exploit these carefully, one at a time:', 'KEY CONTRADICTIONS:')
-            .trim() : '';
-      const rawMatch = system.match(/Age:[^\n]+/);
-
-      // First 3 sentences of persona + key participant facts + contradictions + strategy
-      const personaLines = system.split('\n').slice(0, 3).join('\n');
-      const shortPortrait = portrait.split('. ').slice(0, 3).join('. ') + '.';
-      const shortStrategy = 'STRATEGY: ' + (strategy.split('.')[0] || strategy).trim() + '.';
-
-      compactSystem = [personaLines, '', rawMatch ? rawMatch[0] : '', shortPortrait, '', contradictions || 'No contradictions detected.', '', shortStrategy].filter(Boolean).join('\n');
-    }
-
-    // ── Step 2: Cap history to 6 messages ──
-    const history = (messages || []).slice(-6).map(m => ({
+    // Cap history to last 8 messages (4 exchanges) to prevent context overflow
+    const history = (messages || []).slice(-8).map(m => ({
       role: m.role === 'assistant' ? 'assistant' : 'user',
       content: m.content
     }));
-
-    const openaiMessages = [];
-    if (compactSystem) openaiMessages.push({ role: 'system', content: compactSystem });
     openaiMessages.push(...history);
 
     const estTokens = Math.round(openaiMessages.map(m => m.content).join(' ').length / 4);
-    console.log(`tokens ~${estTokens} | msgs: ${openaiMessages.length} | model: ${MODELS[0]}`);
+    console.log(`tokens ~${estTokens} | model: ${MODELS[0]}`);
 
-    // ── Step 3: Try each model in order ──
     let text = '';
     let lastError = '';
 
@@ -124,54 +162,47 @@ app.post('/api/chat', async (req, res) => {
         const response = await fetch(`${NVIDIA_BASE}/chat/completions`, {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${NVIDIA_KEY}`
+            'Content-Type': 'application/json; charset=utf-8',
+            'Authorization': `Bearer ${NVIDIA_KEY}`,
+            'Accept': 'application/json; charset=utf-8'
           },
           body: JSON.stringify({
             model,
             messages: openaiMessages,
             max_tokens: 300,
-            temperature: 0.7,  // lower = cleaner Arabic, less token corruption
+            temperature: 0.7,
             top_p: 0.85,
             stream: false
           })
         });
 
-        const raw_body = await response.text();
-        console.log(`${model} → HTTP ${response.status}:`, raw_body.slice(0, 200));
+        const rawBody = await response.text();
+        console.log(`${model} HTTP ${response.status}:`, rawBody.slice(0, 200));
 
-        if (!response.ok) {
-          lastError = raw_body;
-          await sleep(500);
-          continue; // try next model
-        }
+        if (!response.ok) { lastError = rawBody; await sleep(500); continue; }
 
-        const data = JSON.parse(raw_body);
+        const data = JSON.parse(rawBody);
         let raw = data.choices?.[0]?.message?.content?.trim() || '';
         if (!raw) { lastError = 'empty'; continue; }
 
-        // ── Step 4: Deep clean Arabic corruption artifacts ──
+        // ── UTF-8 Arabic cleanup ──────────────────────────────
         raw = raw
-          .replace(/^\[[^\]]+\]\s*:?\s*/, '')       // [Name]: prefix
-          .replace(/^\w[\w_]+\s*:\s*/, '')            // Name: prefix
-          .replace(/\*+/g, '')                         // markdown asterisks
-
-          // Remove entire tokens that mix Latin + Arabic scripts (e.g. 'balaلاعة')
+          // Remove [Name]: prefix artifacts
+          .replace(/^\[[^\]]+\]\s*:?\s*/, '')
+          .replace(/^\w[\w_]+\s*:\s*/, '')
+          // Remove markdown formatting
+          .replace(/\*+/g, '').replace(/_+/g, '').replace(/#+\s/g, '')
+          // Kill entire tokens that mix Latin + Arabic (e.g. "balaلاعة")
           .replace(/\S*[a-zA-Z]+[\u0600-\u06FF]\S*/g, '')
           .replace(/\S*[\u0600-\u06FF]+[a-zA-Z]\S*/g, '')
-
-          // Remove isolated Latin words inside Arabic text
+          // Remove isolated short Latin words inside Arabic text
           .replace(/(?<=[\u0600-\u06FF\s،؟!.])[a-zA-Z]{1,8}(?=[\u0600-\u06FF\s،؟!.])/g, '')
-
-          // number+digit artifacts embedded in Arabic (e.g. 'تعتبر6٪بة')
-          .replace(/[\u0600-\u06FF]+\d+[\u066A%]?[\u0600-\u06FF]*/g, m => m.replace(/\d+[\u066A%]?/g, ''))
-          .replace(/\d+[\u066A%][a-zA-Z]*/g, '')
-
-          // Collapse spaces left by removals
+          // Remove digit+percent artifacts embedded in Arabic
+          .replace(/([\u0600-\u06FF]+)\d+[\u066A%]?([\u0600-\u06FF]*)/g, '$1$2')
           .replace(/\s{2,}/g, ' ')
           .trim();
 
-        // If ends mid-sentence, trim to last complete sentence
+        // Trim to last complete sentence if cut mid-sentence
         if (raw && !(/[.!?…،؟]$/.test(raw))) {
           const last = Math.max(
             raw.lastIndexOf('.'), raw.lastIndexOf('!'),
@@ -180,35 +211,30 @@ app.post('/api/chat', async (req, res) => {
           if (last > raw.length * 0.4) raw = raw.substring(0, last + 1).trim();
         }
 
-        if (raw) {
-          text = raw;
-          console.log('SUCCESS:', text.slice(0, 100));
-          break;
-        }
+        if (raw) { text = raw; console.log('OK:', text.slice(0, 80)); break; }
 
       } catch (err) {
         lastError = err.message;
-        console.error(`Model ${model} error:`, err.message);
+        console.error(`${model} error:`, err.message);
         await sleep(500);
       }
     }
 
-    // ── Step 5: In-character fallbacks (never show errors) ──
     if (!text) {
-      console.error('All models failed. Last error:', lastError.slice(0, 200));
-      const isArabic = (history.find(m => m.role === 'user')?.content || '').match(/[\u0600-\u06FF]/);
-      const fallbacks = isArabic
-        ? ['هذه نقطة مثيرة — ما الذي يجعلك تعتقد ذلك تحديدًا؟', 'أفهم وجهة نظرك، لكن هل فكّرت فيما يخسره الطلاب فعلًا؟', 'ما حجتك الرئيسية هنا؟']
-        : ["Interesting — what specifically makes you think that?", "Fair point. But what do students actually lose when they rely only on AI?", "What's your main argument here?"];
+      console.error('All models failed:', lastError.slice(0, 200));
+      const hasArabic = (messages || []).slice(-1)[0]?.content?.match(/[\u0600-\u06FF]/);
+      const fallbacks = hasArabic
+        ? ['ما الذي يجعلك تعتقد ذلك تحديدًا؟', 'نقطة مثيرة — هل يمكنك التوضيح أكثر؟', 'ما حجتك الرئيسية هنا؟']
+        : ["Interesting — what specifically makes you think that?", "Can you say more about that?", "What's your main argument here?"];
       text = fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
 
     res.json({ text });
 
   } catch (e) {
-    console.error('Server crash:', e);
+    console.error('Crash:', e);
     res.json({ text: "Interesting — what specifically makes you think that?" });
   }
 });
 
-app.listen(PORT, () => console.log(`Server on port ${PORT} | NVIDIA: ${!!NVIDIA_KEY} | Model: ${MODELS[0]}`));
+app.listen(PORT, () => console.log(`Server port ${PORT} | NVIDIA: ${!!NVIDIA_KEY}`));
